@@ -20,6 +20,9 @@ open "build/Shoji Machines.app"
 - Themes: `scripts/sync-themes.sh` copies ../lucent's `*.theme` (committed copy too). The active
   theme is read from Shoji's `~/.config/shoji/settings.json`; Shoji posts the distributed
   notification `dev.shoji.settingsChanged` on save, and the Machines window recolours.
+- Window opacity and hidden title bars follow Shoji's Settings → Windows (`windowOpacity`,
+  `hideTitleBars` in settings.json; the older `kittyOpacity`/`kittyHideTitlebar` are read as a
+  fallback).
 - Commit and push only when asked; Co-Authored-By line at the end of commit messages.
 
 ## Files (Sources/ShojiMachines)

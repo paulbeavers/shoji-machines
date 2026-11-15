@@ -12,7 +12,30 @@ final class MachinesAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
     private var machines: MachinesApp!
     private var keyMonitor: Any?
 
+    private var signalSources: [DispatchSourceSignal] = []
+    private var quittingFromSignal = false
+
     func applicationDidFinishLaunching(_ notification: Notification) {
+        // Only one Shoji Machines at a time: two would both own ~/.config/shoji/vms, and starting
+        // the same VM in both would write one disk image from two processes (corruption).
+        if ProcessInfo.processInfo.environment["SHOJI_MACHINES_TEST"] == nil,
+           let other = NSRunningApplication.runningApplications(withBundleIdentifier: Self.bundleID)
+            .first(where: { $0.processIdentifier != getpid() }) {
+            other.activate()
+            NSApp.terminate(nil)
+            return
+        }
+        // `kill` / logout: quit properly, so running VMs get a clean shutdown.
+        for sig in [SIGTERM, SIGINT, SIGHUP] {
+            signal(sig, SIG_IGN)
+            let src = DispatchSource.makeSignalSource(signal: sig, queue: .main)
+            src.setEventHandler { [weak self] in
+                self?.quittingFromSignal = true
+                NSApp.terminate(nil)
+            }
+            src.resume()
+            signalSources.append(src)
+        }
         Config.shared.load()
         buildMenus()
         machines = MachinesApp()
@@ -82,7 +105,7 @@ final class MachinesAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
         let running = VMManager.shared.running.count
         guard running > 0 else { return .terminateNow }
-        if ProcessInfo.processInfo.environment["SHOJI_MACHINES_TEST"] == nil {
+        if ProcessInfo.processInfo.environment["SHOJI_MACHINES_TEST"] == nil, !quittingFromSignal {
             let alert = NSAlert()
             alert.messageText = "Quit Shoji Machines?"
             alert.informativeText = "\(running) running VM\(running == 1 ? "" : "s") will be shut down."
