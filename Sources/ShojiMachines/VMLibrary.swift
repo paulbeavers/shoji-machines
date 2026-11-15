@@ -1,0 +1,446 @@
+import Foundation
+import Virtualization
+
+/// A VM's settings, saved as config.json in its folder.
+struct VMConfig: Codable, Equatable {
+    var id: String
+    var name: String
+    var cpus: Int
+    var memoryMB: Int
+    var diskGB: Int
+    var macAddress: String
+    var image: String          // e.g. "debian-13"
+    var user: String
+    var created: Date
+}
+
+/// Linux cloud images Shoji Machines can create VMs from: ARM64 images with cloud-init, converted to
+/// the raw disk format Virtualization.framework boots and cached in vms/images/.
+struct CloudImage: Sendable {
+    enum Family: Sendable { case debian, ubuntu, fedora, rhel, alpine }
+    enum Source: Sendable {
+        case url(String)
+        /// Newest Fedora Cloud "Generic" aarch64 qcow2 from fedoraproject.org/releases.json.
+        case fedoraLatest
+        /// Newest Alpine generic UEFI cloud-init aarch64 qcow2 from latest-stable.
+        case alpineLatest
+    }
+    enum Format: Sendable {
+        case tarXZ(member: String) // Debian: disk.raw inside a .tar.xz
+        case qcow2
+    }
+
+    let id: String
+    let name: String
+    let family: Family
+    let source: Source
+    let format: Format
+    /// Rough download size, shown in the New VM form.
+    let downloadMB: Int
+
+    static let all: [CloudImage] = [
+        CloudImage(id: "debian-13", name: "Debian 13 (trixie)", family: .debian,
+                   source: .url("https://cloud.debian.org/images/cloud/trixie/latest/debian-13-generic-arm64.tar.xz"),
+                   format: .tarXZ(member: "disk.raw"), downloadMB: 300),
+        CloudImage(id: "debian-12", name: "Debian 12 (bookworm)", family: .debian,
+                   source: .url("https://cloud.debian.org/images/cloud/bookworm/latest/debian-12-generic-arm64.tar.xz"),
+                   format: .tarXZ(member: "disk.raw"), downloadMB: 270),
+        CloudImage(id: "ubuntu-26.04", name: "Ubuntu 26.04 LTS", family: .ubuntu,
+                   source: .url("https://cloud-images.ubuntu.com/resolute/current/resolute-server-cloudimg-arm64.img"),
+                   format: .qcow2, downloadMB: 700),
+        CloudImage(id: "ubuntu-24.04", name: "Ubuntu 24.04 LTS", family: .ubuntu,
+                   source: .url("https://cloud-images.ubuntu.com/noble/current/noble-server-cloudimg-arm64.img"),
+                   format: .qcow2, downloadMB: 620),
+        CloudImage(id: "ubuntu-26.10", name: "Ubuntu 26.10", family: .ubuntu,
+                   source: .url("https://cloud-images.ubuntu.com/stonking/current/stonking-server-cloudimg-arm64.img"),
+                   format: .qcow2, downloadMB: 800),
+        CloudImage(id: "fedora", name: "Fedora Cloud (latest)", family: .fedora,
+                   source: .fedoraLatest, format: .qcow2, downloadMB: 550),
+        CloudImage(id: "rocky-10", name: "Rocky Linux 10", family: .rhel,
+                   source: .url("https://dl.rockylinux.org/pub/rocky/10/images/aarch64/Rocky-10-GenericCloud-Base.latest.aarch64.qcow2"),
+                   format: .qcow2, downloadMB: 520),
+        CloudImage(id: "alma-10", name: "AlmaLinux 10", family: .rhel,
+                   source: .url("https://repo.almalinux.org/almalinux/10/cloud/aarch64/images/AlmaLinux-10-GenericCloud-latest.aarch64.qcow2"),
+                   format: .qcow2, downloadMB: 470),
+        CloudImage(id: "alpine", name: "Alpine Linux (latest)", family: .alpine,
+                   source: .alpineLatest, format: .qcow2, downloadMB: 200),
+    ]
+    static func image(_ id: String) -> CloudImage? { all.first { $0.id == id } }
+
+    var isCached: Bool {
+        FileManager.default.fileExists(atPath: VMLibrary.imagesDirectory.appendingPathComponent("\(id).raw").path)
+    }
+
+    /// The download URL (looked up for the "latest" sources).
+    func resolveURL() async throws -> URL {
+        switch source {
+        case .url(let s):
+            return URL(string: s)!
+        case .fedoraLatest:
+            let (data, _) = try await VMLibrary.retrying { try await URLSession.shared.data(from: URL(string: "https://fedoraproject.org/releases.json")!) }
+            let list = (try JSONSerialization.jsonObject(with: data) as? [[String: Any]]) ?? []
+            let best = list.compactMap { e -> (Int, String)? in
+                guard e["arch"] as? String == "aarch64", e["variant"] as? String == "Cloud",
+                      let v = Int(e["version"] as? String ?? ""), let link = e["link"] as? String,
+                      link.contains("Cloud-Base-Generic"), link.hasSuffix(".qcow2") else { return nil }
+                return (v, link)
+            }.max { $0.0 < $1.0 }
+            guard let link = best?.1, let url = URL(string: link) else { throw VMError.message("Couldn't find the latest Fedora Cloud image") }
+            return url
+        case .alpineLatest:
+            let base = "https://dl-cdn.alpinelinux.org/alpine/latest-stable/releases/cloud/"
+            let (data, _) = try await VMLibrary.retrying { try await URLSession.shared.data(from: URL(string: base)!) }
+            let html = String(decoding: data, as: UTF8.self)
+            let re = try NSRegularExpression(pattern: #"generic_alpine-([0-9.]+)-aarch64-uefi-cloudinit-r([0-9]+)\.qcow2"#)
+            let names = re.matches(in: html, range: NSRange(html.startIndex..., in: html)).compactMap {
+                Range($0.range, in: html).map { String(html[$0]) }
+            }
+            // Highest version (numeric compare), then highest -rN.
+            guard let name = names.max(by: { $0.compare($1, options: .numeric) == .orderedAscending }) else {
+                throw VMError.message("Couldn't find the latest Alpine cloud image")
+            }
+            return URL(string: base + name)!
+        }
+    }
+}
+
+enum VMError: LocalizedError {
+    case message(String)
+    var errorDescription: String? { if case .message(let m) = self { return m }; return nil }
+}
+
+/// VMs on disk: ~/.config/shoji/vms/<id>/ with config.json, disk.img (raw, sparse), seed.iso
+/// (cloud-init), efi-vars and machine-id. Base images are cached in vms/images/.
+enum VMLibrary {
+    static var directory: URL {
+        // Test runs point this elsewhere so they never touch the user's VMs.
+        if let dir = ProcessInfo.processInfo.environment["SHOJI_VMS_DIR"] { return URL(fileURLWithPath: dir) }
+        return Config.directory.appendingPathComponent("vms")
+    }
+    static var imagesDirectory: URL { directory.appendingPathComponent("images") }
+
+    static func folder(_ id: String) -> URL { directory.appendingPathComponent(id) }
+
+    static func all() -> [VMConfig] {
+        let fm = FileManager.default
+        let dirs = (try? fm.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil)) ?? []
+        return dirs.compactMap { dir in
+            guard let data = try? Data(contentsOf: dir.appendingPathComponent("config.json")) else { return nil }
+            return try? JSONDecoder.vm.decode(VMConfig.self, from: data)
+        }.sorted { $0.created < $1.created }
+    }
+
+    static func save(_ c: VMConfig) throws {
+        try FileManager.default.createDirectory(at: folder(c.id), withIntermediateDirectories: true)
+        try JSONEncoder.vm.encode(c).write(to: folder(c.id).appendingPathComponent("config.json"), options: .atomic)
+    }
+
+    /// Delete a VM (to the Trash, so its disk can be recovered).
+    static func delete(_ id: String) throws {
+        try FileManager.default.trashItem(at: folder(id), resultingItemURL: nil)
+    }
+
+    // MARK: Creating
+
+    /// Create a VM: fetch the base image if needed, copy it (APFS clone — instant), grow it,
+    /// and write the cloud-init seed. `progress` gets (message, fraction 0…1 or nil).
+    static func create(name: String, cpus: Int, memoryMB: Int, diskGB: Int, imageID: String,
+                       progress: @escaping @Sendable (String, Double?) -> Void) async throws -> VMConfig {
+        guard let image = CloudImage.image(imageID) else { throw VMError.message("Unknown image \(imageID)") }
+        let base = try await baseImage(image, progress: progress)
+
+        let id = slug(name)
+        let dir = folder(id)
+        let fm = FileManager.default
+        guard !fm.fileExists(atPath: dir.path) else { throw VMError.message("A VM called “\(id)” already exists") }
+        try fm.createDirectory(at: dir, withIntermediateDirectories: true)
+
+        progress("Copying disk…", nil)
+        let disk = dir.appendingPathComponent("disk.img")
+        try fm.copyItem(at: base, to: disk) // APFS clonefile: no extra space until the VM writes
+        let size = UInt64(diskGB) * 1_073_741_824
+        let current = (try? fm.attributesOfItem(atPath: disk.path)[.size] as? UInt64) ?? 0
+        if size > current {
+            let h = try FileHandle(forWritingTo: disk)
+            try h.truncate(atOffset: size) // sparse; cloud-init grows the root partition into it
+            try h.close()
+        }
+
+        let config = VMConfig(id: id, name: name, cpus: cpus, memoryMB: memoryMB, diskGB: diskGB,
+                              macAddress: VZMACAddress.randomLocallyAdministered().string,
+                              image: imageID, user: NSUserName().lowercased(), created: Date())
+        progress("Writing cloud-init seed…", nil)
+        try writeSeed(for: config)
+        try save(config)
+        return config
+    }
+
+    /// Retry transient network failures (dropped connections, timeouts) a couple of times.
+    static func retrying<T>(_ attempts: Int = 3, _ body: () async throws -> T) async throws -> T {
+        var last: Error?
+        for i in 0..<attempts {
+            do { return try await body() } catch let e as URLError {
+                last = e
+                try await Task.sleep(nanoseconds: UInt64(i + 1) * 2_000_000_000)
+            }
+        }
+        throw last!
+    }
+
+    static func slug(_ name: String) -> String {
+        let s = name.lowercased().map { $0.isLetter || $0.isNumber ? $0 : "-" }
+        let joined = String(s).split(separator: "-").joined(separator: "-")
+        return joined.isEmpty ? "vm" : joined
+    }
+
+    /// The cached raw base image, downloading and unpacking it the first time.
+    static func baseImage(_ image: CloudImage, progress: @escaping @Sendable (String, Double?) -> Void) async throws -> URL {
+        let fm = FileManager.default
+        let raw = imagesDirectory.appendingPathComponent("\(image.id).raw")
+        if fm.fileExists(atPath: raw.path) { return raw }
+        try fm.createDirectory(at: imagesDirectory, withIntermediateDirectories: true)
+
+        progress("Downloading \(image.name)…", 0)
+        let url = try await image.resolveURL()
+        let archive = try await retrying { try await Downloader.download(url) { p in progress("Downloading \(image.name)…", p) } }
+        defer { try? fm.removeItem(at: archive) }
+
+        let work = imagesDirectory.appendingPathComponent(".unpack-\(UUID().uuidString)")
+        try fm.createDirectory(at: work, withIntermediateDirectories: true)
+        defer { try? fm.removeItem(at: work) }
+        switch image.format {
+        case .tarXZ(let member):
+            progress("Unpacking \(image.name)…", nil)
+            try run("/usr/bin/tar", ["-xJf", archive.path, "-C", work.path, member])
+            try fm.moveItem(at: work.appendingPathComponent(member), to: raw)
+        case .qcow2:
+            progress("Converting \(image.name)…", 0)
+            let out = work.appendingPathComponent("disk.raw")
+            try QCOW2.convert(archive, to: out) { p in progress("Converting \(image.name)…", p) }
+            try fm.moveItem(at: out, to: raw)
+        }
+        return raw
+    }
+
+    // MARK: cloud-init
+
+    /// A NoCloud seed (ISO9660 volume "cidata"): user, SSH keys, sudo, hostname, and console
+    /// autologin on hvc0 (Shoji's kitty console windows).
+    static func writeSeed(for c: VMConfig) throws {
+        let fm = FileManager.default
+        let work = fm.temporaryDirectory.appendingPathComponent("shoji-seed-\(UUID().uuidString)")
+        try fm.createDirectory(at: work, withIntermediateDirectories: true)
+        defer { try? fm.removeItem(at: work) }
+
+        let keys = sshPublicKeys().map { "      - \($0)" }.joined(separator: "\n")
+        let family = CloudImage.image(c.image)?.family ?? .debian
+        let indentedScript = consoleScript.split(separator: "\n").map { "      " + $0 }.joined(separator: "\n")
+        // Console autologin on hvc0: a systemd drop-in, or (Alpine, busybox init) an inittab line.
+        let consoleSetup: String
+        if family == .alpine {
+            consoleSetup = """
+            packages: [bash, sudo]
+            write_files:
+              - path: /usr/local/bin/shoji-autologin
+                permissions: "0755"
+                content: |
+                  #!/bin/sh
+                  exec /bin/login -f \(c.user)
+              - path: /etc/profile.d/shoji-console.sh
+                content: |
+            \(indentedScript)
+            runcmd:
+              - sed -i '/^hvc0:/d' /etc/inittab
+              - echo 'hvc0::respawn:/sbin/getty -n -l /usr/local/bin/shoji-autologin 38400 hvc0 vt100' >> /etc/inittab
+              - kill -HUP 1
+            """
+        } else {
+            consoleSetup = """
+            write_files:
+              - path: /etc/systemd/system/serial-getty@hvc0.service.d/shoji-autologin.conf
+                content: |
+                  [Service]
+                  ExecStart=
+                  ExecStart=-/sbin/agetty --autologin \(c.user) --keep-baud 115200,57600,38400,9600 %I $TERM
+              - path: /etc/profile.d/shoji-console.sh
+                content: |
+            \(indentedScript)
+            runcmd:
+              - [systemctl, daemon-reload]
+              - [systemctl, restart, serial-getty@hvc0.service]
+            """
+        }
+        // No usable password. Alpine's OpenSSH (no PAM) refuses *any* login, keys included, for a
+        // locked ("!") account, so there the hash is "*" (invalid, but not locked).
+        let passwordLines = family == .alpine
+            ? "    lock_passwd: false\n    hashed_passwd: \"*\""
+            : "    lock_passwd: true"
+        // No group membership: the sudo rule works on every distro (sudo vs wheel groups).
+        let userData = """
+        #cloud-config
+        hostname: \(c.id)
+        users:
+          - name: \(c.user)
+            shell: /bin/bash
+            sudo: ALL=(ALL) NOPASSWD:ALL
+        \(passwordLines)
+        \(keys.isEmpty ? "" : "    ssh_authorized_keys:\n" + keys)
+        ssh_pwauth: false
+        \(consoleSetup)
+        """
+        let metaData = "instance-id: \(c.id)-\(Int(c.created.timeIntervalSince1970))\nlocal-hostname: \(c.id)\n"
+        try userData.write(to: work.appendingPathComponent("user-data"), atomically: true, encoding: .utf8)
+        try metaData.write(to: work.appendingPathComponent("meta-data"), atomically: true, encoding: .utf8)
+        // DHCP with the MAC as client id (systemd-networkd sends a DUID by default), so Shoji can
+        // find the VM's address in macOS's lease file.
+        let network = """
+        version: 2
+        ethernets:
+          primary:
+            match:
+              macaddress: "\(c.macAddress)"
+            dhcp4: true
+            dhcp-identifier: mac
+        """
+        try network.write(to: work.appendingPathComponent("network-config"), atomically: true, encoding: .utf8)
+
+        let seed = folder(c.id).appendingPathComponent("seed.iso")
+        try? fm.removeItem(at: seed)
+        try run("/usr/bin/hdiutil", ["makehybrid", "-quiet", "-iso", "-joliet", "-default-volume-name", "cidata",
+                                     "-o", seed.path, work.path])
+    }
+
+    /// The serial console has no window-size signalling, so on hvc0 the shell asks the terminal for
+    /// the size before each prompt (`CSI 18 t`, answered by kitty) and runs stty.
+    static let consoleScript = #"""
+    # Shoji: keep the serial console's size in step with its tile.
+    if [ "$(tty 2>/dev/null)" = /dev/hvc0 ]; then
+      __shoji_resize() {
+        local saved rows cols
+        saved=$(stty -g)
+        stty raw -echo min 0 time 5
+        printf '\033[18t' > /dev/tty
+        # -t 1: never hang the prompt when nothing answers (no console tile open).
+        IFS=';' read -r -t 1 -d t _ rows cols < /dev/tty
+        stty "$saved"
+        [ -n "$cols" ] && stty rows "$rows" cols "$cols"
+      }
+      PROMPT_COMMAND="__shoji_resize${PROMPT_COMMAND:+;$PROMPT_COMMAND}"
+    fi
+    """#
+
+    static func sshPublicKeys() -> [String] {
+        let dir = URL(fileURLWithPath: NSHomeDirectory()).appendingPathComponent(".ssh")
+        let files = (try? FileManager.default.contentsOfDirectory(at: dir, includingPropertiesForKeys: nil)) ?? []
+        return files.filter { $0.pathExtension == "pub" }.compactMap {
+            (try? String(contentsOf: $0, encoding: .utf8))?.trimmingCharacters(in: .whitespacesAndNewlines)
+        }.filter { !$0.isEmpty }
+    }
+
+    @discardableResult
+    static func run(_ path: String, _ args: [String]) throws -> String {
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: path)
+        p.arguments = args
+        let out = Pipe()
+        p.standardOutput = out
+        p.standardError = out
+        try p.run()
+        let data = out.fileHandleForReading.readDataToEndOfFile()
+        p.waitUntilExit()
+        let text = String(decoding: data, as: UTF8.self)
+        guard p.terminationStatus == 0 else {
+            throw VMError.message("\((path as NSString).lastPathComponent) failed: \(text.trimmingCharacters(in: .whitespacesAndNewlines))")
+        }
+        return text
+    }
+
+    // MARK: Networking
+
+    /// The VM's IPv4 address from macOS's DHCP leases (the NAT network's DHCP server): by MAC,
+    /// else by host name (a guest that sent a DUID instead of its MAC), newest lease first.
+    static func ipAddress(mac: String, hostname: String) -> String? {
+        guard let text = try? String(contentsOfFile: "/var/db/dhcpd_leases", encoding: .utf8) else { return nil }
+        let want = normalize(mac)
+        var byMAC: (ip: String, lease: UInt64)?, byName: (ip: String, lease: UInt64)?
+        for block in text.components(separatedBy: "}") {
+            var ip: String?, hw: String?, name: String?, lease: UInt64 = 0
+            for line in block.split(separator: "\n") {
+                let t = line.trimmingCharacters(in: .whitespaces)
+                if t.hasPrefix("ip_address=") { ip = String(t.dropFirst(11)) }
+                if t.hasPrefix("name=") { name = String(t.dropFirst(5)) }
+                if t.hasPrefix("hw_address=1,") { hw = String(t.dropFirst(13)) }
+                if t.hasPrefix("lease=") { lease = UInt64(t.dropFirst(6).replacingOccurrences(of: "0x", with: ""), radix: 16) ?? 0 }
+            }
+            guard let ip else { continue }
+            if let hw, normalize(hw) == want, lease >= (byMAC?.lease ?? 0) { byMAC = (ip, lease) }
+            if name == hostname, lease >= (byName?.lease ?? 0) { byName = (ip, lease) }
+        }
+        return byMAC?.ip ?? byName?.ip
+    }
+
+    /// "02:0a:…" and "2:a:…" (how bootpd writes it) compare equal.
+    private static func normalize(_ mac: String) -> String {
+        mac.lowercased().split(separator: ":").map { String(Int($0, radix: 16) ?? 0, radix: 16) }.joined(separator: ":")
+    }
+}
+
+/// URLSession download with progress.
+final class Downloader: NSObject, URLSessionDownloadDelegate, @unchecked Sendable {
+    private var continuation: CheckedContinuation<URL, Error>?
+    private let onProgress: @Sendable (Double) -> Void
+
+    private init(onProgress: @escaping @Sendable (Double) -> Void) { self.onProgress = onProgress }
+
+    static func download(_ url: URL, progress: @escaping @Sendable (Double) -> Void) async throws -> URL {
+        let d = Downloader(onProgress: progress)
+        let session = URLSession(configuration: .default, delegate: d, delegateQueue: nil)
+        defer { session.finishTasksAndInvalidate() }
+        return try await withCheckedThrowingContinuation { c in
+            d.continuation = c
+            session.downloadTask(with: url).resume()
+        }
+    }
+
+    func urlSession(_ session: URLSession, downloadTask: URLSessionDownloadTask, didWriteData bytesWritten: Int64,
+                    totalBytesWritten: Int64, totalBytesExpectedToWrite: Int64) {
+        guard totalBytesExpectedToWrite > 0 else { return }
+        onProgress(Double(totalBytesWritten) / Double(totalBytesExpectedToWrite))
+    }
+
+    func urlSession(_ session: URLSession, downloadTask: URLSessionDownloadTask, didFinishDownloadingTo location: URL) {
+        // The file at `location` is deleted when this returns; keep it.
+        let keep = FileManager.default.temporaryDirectory.appendingPathComponent("shoji-dl-\(UUID().uuidString)")
+        do {
+            if let http = downloadTask.response as? HTTPURLResponse, http.statusCode != 200 {
+                throw VMError.message("Download failed: HTTP \(http.statusCode)")
+            }
+            try FileManager.default.moveItem(at: location, to: keep)
+            continuation?.resume(returning: keep)
+        } catch {
+            continuation?.resume(throwing: error)
+        }
+        continuation = nil
+    }
+
+    func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
+        if let error { continuation?.resume(throwing: error); continuation = nil }
+    }
+}
+
+extension JSONEncoder {
+    static var vm: JSONEncoder {
+        let e = JSONEncoder()
+        e.outputFormatting = [.prettyPrinted, .sortedKeys]
+        e.dateEncodingStrategy = .iso8601
+        return e
+    }
+}
+
+extension JSONDecoder {
+    static var vm: JSONDecoder {
+        let d = JSONDecoder()
+        d.dateDecodingStrategy = .iso8601
+        return d
+    }
+}
