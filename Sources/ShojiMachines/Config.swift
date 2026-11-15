@@ -75,6 +75,7 @@ final class Config {
         hideTitlebar = (settings?["hideTitleBars"] as? Bool) ?? (settings?["kittyHideTitlebar"] as? Bool) ?? false
         let opacity = (settings?["windowOpacity"] as? NSNumber) ?? (settings?["kittyOpacity"] as? NSNumber)
         windowOpacity = CGFloat(min(1, max(0.3, opacity?.doubleValue ?? 0.9)))
+        _ = ThemeLibrary.all(reload: true) // themes added or edited since launch (picked in Shoji)
         let theme = ThemeLibrary.theme(saved ?? ThemeLibrary.defaultID) ?? ThemeLibrary.theme(ThemeLibrary.defaultID)
         if let theme {
             themeID = theme.id

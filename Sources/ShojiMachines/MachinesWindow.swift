@@ -211,11 +211,18 @@ final class MachinesApp: NSObject, NSTextFieldDelegate {
         empty.textColor = c.overlay0
     }
 
+    /// With title bars hidden the content runs under where the title bar was (still there,
+    /// transparent, and it takes clicks): keep controls below it.
+    private var titlebarInset: CGFloat {
+        guard let w = view.window, w.styleMask.contains(.fullSizeContentView) else { return 0 }
+        return max(0, w.frame.height - w.contentLayoutRect.height)
+    }
+
     private func layout() {
         scroll.frame = view.bounds
         let width = max(380, min(1000, view.bounds.width - 40))
         let x0 = (view.bounds.width - width) / 2
-        var y: CGFloat = 22
+        var y: CGFloat = 22 + titlebarInset
         heading.sizeToFit()
         heading.frame.origin = CGPoint(x: x0, y: y)
         newButton.sizeToFit()
@@ -381,7 +388,7 @@ final class NewVMForm: NSView {
 
     func applyColors() {
         let c = Config.shared
-        layer?.backgroundColor = c.base.withAlphaComponent(c.windowOpacity).cgColor
+        layer?.backgroundColor = NSColor.clear.cgColor // see VMRowView.applyColors
         layer?.borderWidth = 1
         layer?.borderColor = c.accent.withAlphaComponent(0.5).cgColor
         labels.forEach { $0.textColor = c.overlay0 }
@@ -518,10 +525,12 @@ final class VMRowView: NSView {
 
     func applyColors() {
         let c = Config.shared
+        // No fill of its own at rest: the window is already translucent (Settings → Windows), and a
+        // translucent card on a translucent window stacks into near-opaque. An outline marks it.
         layer?.backgroundColor = (isSelected ? c.accent.withAlphaComponent(0.18)
-                                  : hovering ? c.surface0.withAlphaComponent(0.6) : c.base.withAlphaComponent(c.windowOpacity)).cgColor
-        layer?.borderWidth = isSelected ? 1 : 0
-        layer?.borderColor = c.accent.withAlphaComponent(0.6).cgColor
+                                  : hovering ? c.surface0.withAlphaComponent(0.6) : NSColor.clear).cgColor
+        layer?.borderWidth = 1
+        layer?.borderColor = (isSelected ? c.accent.withAlphaComponent(0.6) : c.surface0).cgColor
         let stateColor: NSColor
         switch vm.state {
         case .running: stateColor = c.accent2

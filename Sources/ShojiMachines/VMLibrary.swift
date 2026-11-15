@@ -444,3 +444,37 @@ extension JSONDecoder {
         return d
     }
 }
+
+/// An exclusive lock on the VMs folder (`.lock`, flock), held for the process's lifetime. Covers
+/// every way of starting Shoji Machines (two bundles, `swift run`, a race between two launches),
+/// and releases by itself when the process ends, however it ends.
+@MainActor
+enum VMFolderLock {
+    private static var fd: Int32 = -1
+
+    static func acquire() -> Bool {
+        try? FileManager.default.createDirectory(at: VMLibrary.directory, withIntermediateDirectories: true)
+        let path = VMLibrary.directory.appendingPathComponent(".lock").path
+        let f = open(path, O_CREAT | O_RDWR, 0o600)
+        guard f >= 0 else { return true } // can't even create it: don't block the app over that
+        guard flock(f, LOCK_EX | LOCK_NB) == 0 else { close(f); return false }
+        fd = f
+        return true
+    }
+
+    /// Another copy holds the folder: bring its window forward (opening the app sends it a
+    /// reopen event, which shows the Machines window even if it was closed).
+    static func showRunningCopy() {
+        let others = NSRunningApplication.runningApplications(withBundleIdentifier: MachinesAppDelegate.bundleID)
+            .filter { $0.processIdentifier != getpid() }
+        if let url = others.first?.bundleURL {
+            let p = Process()
+            p.executableURL = URL(fileURLWithPath: "/usr/bin/open")
+            p.arguments = [url.path]
+            try? p.run()
+            p.waitUntilExit()
+        } else {
+            FileHandle.standardError.write(Data("Another Shoji Machines is using \(VMLibrary.directory.path)\n".utf8))
+        }
+    }
+}

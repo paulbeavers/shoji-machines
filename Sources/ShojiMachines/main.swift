@@ -15,6 +15,12 @@ if let i = CommandLine.arguments.firstIndex(of: "--console"), i + 1 < CommandLin
 }
 
 MainActor.assumeIsolated {
+    // One Shoji Machines per VMs folder: two would start the same VM against one disk image.
+    // The lock is per folder, so a test run on a scratch folder never blocks the real app.
+    if !VMFolderLock.acquire() {
+        VMFolderLock.showRunningCopy()
+        exit(0)
+    }
     let app = NSApplication.shared
     let delegate = MachinesAppDelegate()
     app.delegate = delegate
