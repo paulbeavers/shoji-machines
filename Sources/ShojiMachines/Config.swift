@@ -41,6 +41,10 @@ final class Config {
 
     var themeID = "catppuccin-mocha"
     var palette = Palette.mocha
+    /// Shoji's Settings → Windows → Window opacity (`windowOpacity`), shared with kitty.
+    var windowOpacity: CGFloat = 1
+    /// Shoji's Settings → Windows → Hide title bars (`hideTitleBars`).
+    var hideTitlebar = false
 
     var isLight: Bool { palette.isLight }
     var appearance: NSAppearance { NSAppearance(named: isLight ? .aqua : .darkAqua)! }
@@ -65,8 +69,12 @@ final class Config {
     /// The theme from Shoji's settings (Lucent's default if Shoji hasn't saved one).
     func load() {
         let url = Self.directory.appendingPathComponent("settings.json")
-        let saved = (try? Data(contentsOf: url))
-            .flatMap { try? JSONSerialization.jsonObject(with: $0) as? [String: Any] }?["theme"] as? String
+        let settings = (try? Data(contentsOf: url)).flatMap { try? JSONSerialization.jsonObject(with: $0) as? [String: Any] }
+        let saved = settings?["theme"] as? String
+        // (kitty… are the names before Shoji's Windows section; read until Shoji saves again.)
+        hideTitlebar = (settings?["hideTitleBars"] as? Bool) ?? (settings?["kittyHideTitlebar"] as? Bool) ?? false
+        let opacity = (settings?["windowOpacity"] as? NSNumber) ?? (settings?["kittyOpacity"] as? NSNumber)
+        windowOpacity = CGFloat(min(1, max(0.3, opacity?.doubleValue ?? 0.9)))
         let theme = ThemeLibrary.theme(saved ?? ThemeLibrary.defaultID) ?? ThemeLibrary.theme(ThemeLibrary.defaultID)
         if let theme {
             themeID = theme.id

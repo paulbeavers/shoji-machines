@@ -205,7 +205,7 @@ final class MachinesApp: NSObject, NSTextFieldDelegate {
 
     private func applyColors() {
         view.appearance = c.appearance
-        view.layer?.backgroundColor = c.mantle.cgColor
+        view.layer?.backgroundColor = c.mantle.withAlphaComponent(c.windowOpacity).cgColor
         heading.textColor = c.text
         summary.textColor = c.subtext
         empty.textColor = c.overlay0
@@ -381,7 +381,7 @@ final class NewVMForm: NSView {
 
     func applyColors() {
         let c = Config.shared
-        layer?.backgroundColor = c.base.cgColor
+        layer?.backgroundColor = c.base.withAlphaComponent(c.windowOpacity).cgColor
         layer?.borderWidth = 1
         layer?.borderColor = c.accent.withAlphaComponent(0.5).cgColor
         labels.forEach { $0.textColor = c.overlay0 }
@@ -519,7 +519,7 @@ final class VMRowView: NSView {
     func applyColors() {
         let c = Config.shared
         layer?.backgroundColor = (isSelected ? c.accent.withAlphaComponent(0.18)
-                                  : hovering ? c.surface0.withAlphaComponent(0.6) : c.base).cgColor
+                                  : hovering ? c.surface0.withAlphaComponent(0.6) : c.base.withAlphaComponent(c.windowOpacity)).cgColor
         layer?.borderWidth = isSelected ? 1 : 0
         layer?.borderColor = c.accent.withAlphaComponent(0.6).cgColor
         let stateColor: NSColor

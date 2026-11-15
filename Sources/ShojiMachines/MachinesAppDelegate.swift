@@ -21,6 +21,13 @@ final class MachinesAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
         window.title = "Machines"
         window.contentView = machines.view
         window.isReleasedWhenClosed = false
+        // See-through like the terminals: the view draws its own (translucent) background.
+        window.isOpaque = false
+        window.backgroundColor = .clear
+        applyTitlebar()
+        NotificationCenter.default.addObserver(forName: .configDidChange, object: nil, queue: .main) { [weak self] _ in
+            MainActor.assumeIsolated { self?.applyTitlebar() }
+        }
         window.delegate = self
         window.setFrameAutosaveName("ShojiMachines")
         if !window.setFrameUsingName("ShojiMachines") { window.center() }
@@ -42,6 +49,19 @@ final class MachinesAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
         }
         if MachinesTest.run() { return } // scripted test (SHOJI_MACHINES_TEST), headless
         showWindow()
+    }
+
+    /// Like kitty with hide_window_decorations titlebar-only: no title bar or traffic lights, but
+    /// still resizable (and movable by its background, though Shoji places it anyway).
+    private func applyTitlebar() {
+        let hide = Config.shared.hideTitlebar
+        if hide { window.styleMask.insert(.fullSizeContentView) } else { window.styleMask.remove(.fullSizeContentView) }
+        window.titlebarAppearsTransparent = hide
+        window.titleVisibility = hide ? .hidden : .visible
+        window.isMovableByWindowBackground = hide
+        for b in [NSWindow.ButtonType.closeButton, .miniaturizeButton, .zoomButton] {
+            window.standardWindowButton(b)?.isHidden = hide
+        }
     }
 
     private func showWindow() {
