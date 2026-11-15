@@ -25,11 +25,19 @@ open "build/Shoji Machines.app"
   fallback).
 - Commit and push only when asked; Co-Authored-By line at the end of commit messages.
 
+## Distribution
+
+Ships inside the Shoji installer: `../shoji/scripts/package.sh` builds this repo too and puts
+Shoji Machines in the `.pkg`/`.dmg`, which `../shoji/scripts/deploy-web.sh` publishes on
+https://shoji.pbcs.io (an end-user download page — see shoji's CLAUDE.md). A change here
+reaches users only after a new package + deploy from the shoji repo. The installer's preinstall
+script SIGTERMs this app before replacing it (the signal handler stops VMs cleanly).
+
 ## Files (Sources/ShojiMachines)
 
 | File | Role |
 |---|---|
-| `main.swift` | `--console` client mode, `--render-icon`, else the app |
+| `main.swift` | `--console` client mode, `--render-icon`, the single-instance lock, else the app |
 | `MachinesAppDelegate.swift` | Window, menus, reopen, quit (asks, then `stopAll` with `.terminateLater`) |
 | `MachinesWindow.swift` | The Machines list + New VM form (`MachinesApp`, `NewVMForm`, `VMRowView`) |
 | `VMLibrary.swift`, `QCOW2.swift`, `VMManager.swift` | VM engine (images, cloud-init seed, VZ config, lifecycle) |
@@ -59,6 +67,25 @@ open "build/Shoji Machines.app"
   client, `write(fd, &buf[off], …)` passes a pointer to a one-byte temporary — use
   `buf.withUnsafeBytes`.
 
+## Code review decisions (2026-11-14) — keep these
+
+- **Single instance = a lock on the VMs folder** (`VMFolderLock` in VMLibrary.swift: `flock` on
+  `<VMs dir>/.lock`, held for the process lifetime). Two copies on one folder would both run the
+  same VM disks. Checking running apps by bundle id raced and blocked tests; with the lock a test
+  using `SHOJI_VMS_DIR=<scratch>` never collides with the user's copy. A second launch runs
+  `/usr/bin/open` on the running copy's bundle URL (a reopen event shows its window — `activate()`
+  alone didn't) and exits.
+- **Quitting:** `applicationShouldTerminate` sets `quitting` before `stopAll` and cancels a second
+  terminate. Signals (SIGTERM from `kill` or the installer): ignored if already quitting; during the
+  "VMs running — quit?" alert they `abortModal()`, which counts as Quit; otherwise `terminate`.
+  A background watchdog exits after 30 s if stopping hangs.
+- **Translucency:** the window paints `mantle × windowOpacity` once; rows (`VMRowView`) and the New
+  VM form are clear with a 1 px surface0 outline. A second translucent fill stacked the alpha and
+  made them look opaque.
+- **Hidden title bar:** content is laid out from `titlebarInset` (window height − contentLayoutRect)
+  down — the transparent title-bar strip drags the window, so controls there can't be clicked.
+- `Config.load()` reloads the theme library (`ThemeLibrary.all(reload: true)`), so a theme added
+  after launch is found.
 
 ## Testing — the user's real VMs and desktop
 
