@@ -16,3 +16,7 @@ open "build/Shoji Machines.app"
   console works without networking and follows the kitty window's size.
 - VMs, images and settings live in `~/.config/shoji` (shared with Shoji; the theme follows Shoji's).
 - Requires an Apple Silicon Mac, macOS 13+, kitty, and a Swift toolchain to build.
+
+## License
+
+MIT — see [LICENSE](LICENSE).
